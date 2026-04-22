@@ -11,7 +11,6 @@ import {
   getPost,
   getPostImageMeta,
   getCivitaiImageBase,
-  fetchCivitaiImage,
   fetchModel
 } from '../src/civitaiApi.mjs';
 import headers from '../src/headers.mjs';
@@ -38,8 +37,8 @@ function saveGuiConfig (cfg) {
 
 function createWindow () {
   mainWindow = new BrowserWindow({
-    width: 1000,
-    height: 720,
+    width: 1100,
+    height: 780,
     title: 'Civitai Sync GUI',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -87,23 +86,13 @@ function parseCivitaiUrl (raw) {
     if (Number.isFinite(id)) return { kind: 'model', id, modelVersionId };
   }
 
-  if (seg[0] === 'user' && seg[1]) {
-    return { kind: 'user', username: decodeURIComponent(seg[1]) };
-  }
-
   return { kind: 'unknown' };
 }
 
-// ---------- Download helpers ----------
+// ---------- Helpers ----------
 
 function sanitizeName (s) {
   return String(s || '').replace(/[\\/:*?"<>|]/g, '_').slice(0, 120);
-}
-
-async function downloadStream (stream, filepath) {
-  await mkdirp(path.dirname(filepath));
-  const out = fs.createWriteStream(filepath);
-  await pipeline(Readable.fromWeb(stream), out);
 }
 
 function emit (event, payload) {
@@ -112,18 +101,61 @@ function emit (event, payload) {
   }
 }
 
-async function downloadPost ({ postId, secretKey, downloadDir, subfolder, signal }) {
-  emit('log', { level: 'info', msg: `Fetching post ${postId}...` });
+// Minimal image-fetch rate limiter (images only)
+let _lastImgFetch = 0;
+const IMG_RATE_MS = 100;
+async function imgRateLimit () {
+  const now = Date.now();
+  const wait = _lastImgFetch + IMG_RATE_MS - now;
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  _lastImgFetch = Date.now();
+}
+
+/**
+ * Stream a URL to a file, emitting byte-level progress.
+ * onProgress({ bytes, totalBytes }) fires throttled to ~10/s.
+ */
+async function downloadHttp (url, filepath, { fetchHeaders = {}, signal, onProgress, rateLimit = false } = {}) {
+  if (rateLimit) await imgRateLimit();
+
+  const resp = await fetch(url, { headers: fetchHeaders, signal });
+  if (resp.status !== 200) return { ok: false, status: resp.status };
+
+  const totalBytes = Number(resp.headers.get('content-length')) || 0;
+  let bytes = 0;
+  let lastEmit = 0;
+
+  await mkdirp(path.dirname(filepath));
+  const body = Readable.fromWeb(resp.body);
+  body.on('data', (chunk) => {
+    bytes += chunk.length;
+    const now = Date.now();
+    if (onProgress && (now - lastEmit > 100 || bytes === totalBytes)) {
+      lastEmit = now;
+      onProgress({ bytes, totalBytes });
+    }
+  });
+
+  const out = fs.createWriteStream(filepath);
+  await pipeline(body, out);
+  if (onProgress) onProgress({ bytes, totalBytes, done: true });
+  return { ok: true, bytes, totalBytes };
+}
+
+const imageFetchHeaders = { ...headers.sharedHeaders, ...headers.imageHeaders };
+
+// ---------- Per-kind download implementations ----------
+
+async function downloadPost ({ postId, secretKey, downloadDir, subfolder, signal, onItemProgress, onByteProgress }) {
+  emit('log', { msg: `抓取 post ${postId}...` });
 
   const postData = await getPost({ id: postId, secretKey, signal });
-  if (postData?.error) {
-    throw new Error(postData.error?.json?.message || 'Post request failed');
-  }
+  if (postData?.error) throw new Error(postData.error?.json?.message || 'Post request failed');
   const post = postData?.result?.data?.json;
   if (!post) throw new Error('Post not found');
 
   const images = await getPostImageMeta({ postId, secretKey, signal });
-  emit('log', { level: 'info', msg: `Post has ${images.length} media item(s)` });
+  emit('log', { msg: `Post 有 ${images.length} 个媒体` });
 
   const cdnBase = await getCivitaiImageBase({ secretKey });
   const folderName = subfolder
@@ -131,8 +163,6 @@ async function downloadPost ({ postId, secretKey, downloadDir, subfolder, signal
     : `post_${postId}_${sanitizeName(post.title || '')}`.replace(/_+$/, '');
   const outDir = path.join(downloadDir, folderName);
   await mkdirp(outDir);
-
-  // Save post metadata
   fs.writeFileSync(path.join(outDir, 'post.json'), JSON.stringify({ post, images }, null, 2));
 
   let saved = 0;
@@ -148,26 +178,28 @@ async function downloadPost ({ postId, secretKey, downloadDir, subfolder, signal
     const filepath = path.join(outDir, filename);
 
     if (fs.existsSync(filepath)) {
-      emit('progress', { current: i + 1, total: images.length, skipped: true, file: filename });
+      onItemProgress?.({ current: i + 1, total: images.length, file: filename, skipped: true });
       saved++;
       continue;
     }
 
-    emit('progress', { current: i + 1, total: images.length, file: filename });
-    const body = await fetchCivitaiImage(url, { signal });
-    if (!body) {
-      emit('log', { level: 'warn', msg: `Skipped (fetch failed): ${filename}` });
-      continue;
-    }
-    await downloadStream(body, filepath);
+    onItemProgress?.({ current: i + 1, total: images.length, file: filename });
+
+    const r = await downloadHttp(url, filepath, {
+      fetchHeaders: imageFetchHeaders,
+      signal,
+      rateLimit: true,
+      onProgress: (p) => onByteProgress?.({ file: filename, ...p })
+    });
+    if (!r.ok) { emit('log', { level: 'warn', msg: `HTTP ${r.status}: ${filename}` }); continue; }
     saved++;
   }
 
   return { outDir, saved, total: images.length };
 }
 
-async function downloadModel ({ modelId, modelVersionId, secretKey, downloadDir, subfolder, signal }) {
-  emit('log', { level: 'info', msg: `Fetching model ${modelId}...` });
+async function downloadModel ({ modelId, modelVersionId, secretKey, downloadDir, subfolder, signal, onItemProgress, onByteProgress }) {
+  emit('log', { msg: `抓取 model ${modelId}...` });
 
   const model = await fetchModel(modelId);
   if (model?.error) throw new Error(model.error?.json?.message || 'Model request failed');
@@ -182,9 +214,8 @@ async function downloadModel ({ modelId, modelVersionId, secretKey, downloadDir,
     : `model_${modelId}_${sanitizeName(model.name || '')}`;
   const outDir = path.join(downloadDir, folderName);
   await mkdirp(outDir);
-
   fs.writeFileSync(path.join(outDir, 'model.json'), JSON.stringify(model, null, 2));
-  emit('log', { level: 'info', msg: `Version: ${version.name} — ${version.files?.length || 0} file(s)` });
+  emit('log', { msg: `版本: ${version.name} — ${version.files?.length || 0} 个文件` });
 
   const files = version.files || [];
   let saved = 0;
@@ -194,25 +225,26 @@ async function downloadModel ({ modelId, modelVersionId, secretKey, downloadDir,
     const f = files[i];
     const filepath = path.join(outDir, sanitizeName(f.name));
     if (fs.existsSync(filepath)) {
-      emit('progress', { current: i + 1, total: files.length, skipped: true, file: f.name });
+      onItemProgress?.({ current: i + 1, total: files.length, file: f.name, skipped: true });
       saved++;
       continue;
     }
 
-    emit('progress', { current: i + 1, total: files.length, file: f.name });
+    onItemProgress?.({ current: i + 1, total: files.length, file: f.name });
+
     const fetchHeaders = secretKey ? { Authorization: `Bearer ${secretKey}` } : {};
-    const resp = await fetch(f.downloadUrl, { headers: fetchHeaders, signal });
-    if (resp.status !== 200) {
-      emit('log', { level: 'warn', msg: `HTTP ${resp.status} for ${f.name}` });
-      continue;
-    }
-    await downloadStream(resp.body, filepath);
+    const r = await downloadHttp(f.downloadUrl, filepath, {
+      fetchHeaders,
+      signal,
+      onProgress: (p) => onByteProgress?.({ file: f.name, ...p })
+    });
+    if (!r.ok) { emit('log', { level: 'warn', msg: `HTTP ${r.status}: ${f.name}` }); continue; }
     saved++;
   }
 
-  // Also grab version preview images
+  // Version preview images
   const imgs = version.images || [];
-  if (imgs.length) {
+  if (imgs.length && !signal?.aborted) {
     const imgDir = path.join(outDir, 'previews');
     await mkdirp(imgDir);
     for (let i = 0; i < imgs.length; i++) {
@@ -224,42 +256,81 @@ async function downloadModel ({ modelId, modelVersionId, secretKey, downloadDir,
       const filepath = path.join(imgDir, filename);
       if (fs.existsSync(filepath)) continue;
       try {
-        const resp = await fetch(img.url, {
-          headers: { ...headers.sharedHeaders, ...headers.imageHeaders },
-          signal
+        await downloadHttp(img.url, filepath, {
+          fetchHeaders: imageFetchHeaders,
+          signal,
+          rateLimit: true
         });
-        if (resp.status === 200) await downloadStream(resp.body, filepath);
-      } catch { /* ignore */ }
+      } catch { /* ignore previews */ }
     }
   }
 
   return { outDir, saved, total: files.length };
 }
 
-async function downloadSingleImage ({ imageId, secretKey, downloadDir, subfolder, signal }) {
-  emit('log', { level: 'info', msg: `Resolving image ${imageId}...` });
-  const url = `https://civitai.red/api/v1/images?imageId=${imageId}&limit=1`;
-  const resp = await fetch(url, {
+async function downloadSingleImage ({ imageId, secretKey, downloadDir, subfolder, signal, onItemProgress, onByteProgress }) {
+  emit('log', { msg: `抓取 image ${imageId}...` });
+  const apiUrl = `https://civitai.red/api/v1/images?imageId=${imageId}&limit=1`;
+  const resp = await fetch(apiUrl, {
     headers: { ...headers.sharedHeaders, ...headers.jsonHeaders, Authorization: `Bearer ${secretKey}` },
     signal
   });
   const data = await resp.json();
   const item = data?.items?.[0];
-  if (!item) throw new Error('Image not found (API may require post URL instead)');
+  if (!item) throw new Error('Image not found');
 
   const outDir = path.join(downloadDir, subfolder ? sanitizeName(subfolder) : 'images');
   await mkdirp(outDir);
   const ext = item.type === 'video' ? '.mp4' : '.jpeg';
-  const filepath = path.join(outDir, `${imageId}${ext}`);
+  const filename = `${imageId}${ext}`;
+  const filepath = path.join(outDir, filename);
+  fs.writeFileSync(path.join(outDir, `${imageId}.json`), JSON.stringify(item, null, 2));
 
-  if (!fs.existsSync(filepath)) {
-    const body = await fetchCivitaiImage(item.url, { signal });
-    if (!body) throw new Error('Image fetch failed');
-    await downloadStream(body, filepath);
+  if (fs.existsSync(filepath)) {
+    onItemProgress?.({ current: 1, total: 1, file: filename, skipped: true });
+    return { outDir, saved: 1, total: 1 };
   }
 
-  fs.writeFileSync(path.join(outDir, `${imageId}.json`), JSON.stringify(item, null, 2));
+  onItemProgress?.({ current: 1, total: 1, file: filename });
+  const r = await downloadHttp(item.url, filepath, {
+    fetchHeaders: imageFetchHeaders,
+    signal,
+    rateLimit: true,
+    onProgress: (p) => onByteProgress?.({ file: filename, ...p })
+  });
+
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return { outDir, saved: 1, total: 1 };
+}
+
+// ---------- Dispatch one task ----------
+
+async function runTask (task, cfg, { signal, taskIndex, totalTasks }) {
+  const parsed = parseCivitaiUrl(task.url);
+  if (parsed.kind === 'unknown') throw new Error(`URL not recognized: ${task.url}`);
+
+  const onItemProgress = (p) => emit('progress:item', { taskIndex, totalTasks, url: task.url, ...p });
+  const onByteProgress = (p) => emit('progress:bytes', { taskIndex, totalTasks, url: task.url, ...p });
+
+  const common = {
+    secretKey: cfg.secretKey,
+    downloadDir: cfg.downloadDir,
+    subfolder: task.subfolder,
+    signal,
+    onItemProgress,
+    onByteProgress
+  };
+
+  if (parsed.kind === 'post') {
+    return await downloadPost({ postId: parsed.id, ...common });
+  }
+  if (parsed.kind === 'model') {
+    return await downloadModel({ modelId: parsed.id, modelVersionId: task.modelVersionId || parsed.modelVersionId, ...common });
+  }
+  if (parsed.kind === 'image') {
+    return await downloadSingleImage({ imageId: parsed.id, ...common });
+  }
+  throw new Error(`Unsupported kind: ${parsed.kind}`);
 }
 
 // ---------- IPC ----------
@@ -279,127 +350,120 @@ ipcMain.handle('openPath', (_e, p) => shell.openPath(p));
 
 ipcMain.handle('api:verifyKey', async (_e, { secretKey }) => {
   const me = await getMe({ secretKey });
-  if (me?.error || !me?.username) {
-    return { ok: false, error: me?.error?.message || 'Invalid key' };
-  }
+  if (me?.error || !me?.username) return { ok: false, error: me?.error?.message || 'Invalid key' };
   return { ok: true, username: me.username };
 });
 
 ipcMain.handle('parseUrl', (_e, url) => parseCivitaiUrl(url));
 
-ipcMain.handle('preview:fetch', async (_e, { url }) => {
+ipcMain.handle('preview:fetch', async (_e, { urls }) => {
+  const list = Array.isArray(urls) ? urls : [urls];
   const cfg = loadGuiConfig();
   if (!cfg.secretKey) return { ok: false, error: 'API key not set' };
 
-  const parsed = parseCivitaiUrl(url);
-  if (parsed.kind === 'unknown') return { ok: false, error: 'URL not recognized' };
-
-  try {
-    if (parsed.kind === 'post') {
-      const postData = await getPost({ id: parsed.id, secretKey: cfg.secretKey });
-      if (postData?.error) throw new Error(postData.error?.json?.message || 'Post request failed');
-      const post = postData?.result?.data?.json;
-      if (!post) throw new Error('Post not found');
-      const images = await getPostImageMeta({ postId: parsed.id, secretKey: cfg.secretKey });
-      const cdnBase = await getCivitaiImageBase({ secretKey: cfg.secretKey });
-      const items = images.map((img) => {
-        const ext = img.type === 'video' ? '.mp4' : '.jpeg';
-        const thumb = `${cdnBase}/${img.url}/width=450/${img.url}.jpeg`;
-        const full = img.name
-          ? `${cdnBase}/${img.url}/original=true/${img.name.split('?')[0].replace(/\.[^.]+$/, '')}${ext}`
-          : `${cdnBase}/${img.url}/original=true/${img.url}${ext}`;
-        return { id: img.id, type: img.type || 'image', thumb, full, width: img.width, height: img.height };
-      });
-      return {
-        ok: true,
-        kind: 'post',
-        id: parsed.id,
-        title: post.title || `Post #${parsed.id}`,
-        username: post.user?.username || '',
-        publishedAt: post.publishedAt,
-        items,
-        suggestedFolder: sanitizeName(`post_${parsed.id}_${post.title || ''}`.replace(/_+$/, ''))
-      };
+  const results = [];
+  for (const url of list) {
+    const parsed = parseCivitaiUrl(url);
+    if (parsed.kind === 'unknown') {
+      results.push({ ok: false, url, error: 'URL not recognized' });
+      continue;
     }
-
-    if (parsed.kind === 'model') {
-      const model = await fetchModel(parsed.id);
-      if (model?.error) throw new Error(model.error?.json?.message || 'Model request failed');
-      if (!model?.modelVersions?.length) throw new Error('Model has no versions');
-      const versions = model.modelVersions.map(v => ({
-        id: v.id,
-        name: v.name,
-        baseModel: v.baseModel,
-        files: (v.files || []).map(f => ({ name: f.name, size: f.sizeKB, type: f.type })),
-        previews: (v.images || []).slice(0, 8).map(i => ({ url: i.url, type: i.type || 'image' }))
-      }));
-      return {
-        ok: true,
-        kind: 'model',
-        id: parsed.id,
-        title: model.name,
-        modelType: model.type,
-        creator: model.creator?.username || '',
-        versions,
-        selectedVersionId: parsed.modelVersionId || versions[0]?.id,
-        suggestedFolder: sanitizeName(`model_${parsed.id}_${model.name || ''}`)
-      };
+    try {
+      if (parsed.kind === 'post') {
+        const postData = await getPost({ id: parsed.id, secretKey: cfg.secretKey });
+        if (postData?.error) throw new Error(postData.error?.json?.message || 'Post request failed');
+        const post = postData?.result?.data?.json;
+        if (!post) throw new Error('Post not found');
+        const images = await getPostImageMeta({ postId: parsed.id, secretKey: cfg.secretKey });
+        const cdnBase = await getCivitaiImageBase({ secretKey: cfg.secretKey });
+        const items = images.map((img) => {
+          const ext = img.type === 'video' ? '.mp4' : '.jpeg';
+          const thumb = `${cdnBase}/${img.url}/width=450/${img.url}.jpeg`;
+          const full = img.name
+            ? `${cdnBase}/${img.url}/original=true/${img.name.split('?')[0].replace(/\.[^.]+$/, '')}${ext}`
+            : `${cdnBase}/${img.url}/original=true/${img.url}${ext}`;
+          return { id: img.id, type: img.type || 'image', thumb, full };
+        });
+        results.push({
+          ok: true, url, kind: 'post', id: parsed.id,
+          title: post.title || `Post #${parsed.id}`,
+          username: post.user?.username || '',
+          itemCount: items.length, items,
+          suggestedFolder: sanitizeName(`post_${parsed.id}_${post.title || ''}`.replace(/_+$/, ''))
+        });
+      }
+      else if (parsed.kind === 'model') {
+        const model = await fetchModel(parsed.id);
+        if (model?.error) throw new Error(model.error?.json?.message || 'Model request failed');
+        if (!model?.modelVersions?.length) throw new Error('Model has no versions');
+        const versions = model.modelVersions.map(v => ({
+          id: v.id, name: v.name, baseModel: v.baseModel,
+          files: (v.files || []).map(f => ({ name: f.name, size: f.sizeKB, type: f.type })),
+          previews: (v.images || []).slice(0, 8).map(i => ({ url: i.url, type: i.type || 'image' }))
+        }));
+        results.push({
+          ok: true, url, kind: 'model', id: parsed.id,
+          title: model.name, modelType: model.type,
+          creator: model.creator?.username || '',
+          versions,
+          selectedVersionId: parsed.modelVersionId || versions[0]?.id,
+          suggestedFolder: sanitizeName(`model_${parsed.id}_${model.name || ''}`)
+        });
+      }
+      else if (parsed.kind === 'image') {
+        const resp = await fetch(`https://civitai.red/api/v1/images?imageId=${parsed.id}&limit=1`, {
+          headers: { ...headers.sharedHeaders, ...headers.jsonHeaders, Authorization: `Bearer ${cfg.secretKey}` }
+        });
+        const data = await resp.json();
+        const item = data?.items?.[0];
+        if (!item) throw new Error('Image not found');
+        results.push({
+          ok: true, url, kind: 'image', id: parsed.id,
+          title: `Image #${parsed.id}`,
+          itemCount: 1,
+          items: [{ id: item.id, type: item.type || 'image', thumb: item.url, full: item.url }],
+          suggestedFolder: 'images'
+        });
+      }
     }
-
-    if (parsed.kind === 'image') {
-      const resp = await fetch(`https://civitai.red/api/v1/images?imageId=${parsed.id}&limit=1`, {
-        headers: { ...headers.sharedHeaders, ...headers.jsonHeaders, Authorization: `Bearer ${cfg.secretKey}` }
-      });
-      const data = await resp.json();
-      const item = data?.items?.[0];
-      if (!item) throw new Error('Image not found');
-      return {
-        ok: true,
-        kind: 'image',
-        id: parsed.id,
-        title: `Image #${parsed.id}`,
-        items: [{ id: item.id, type: item.type || 'image', thumb: item.url, full: item.url, width: item.width, height: item.height }],
-        suggestedFolder: 'images'
-      };
+    catch (err) {
+      results.push({ ok: false, url, error: err.message });
     }
-
-    return { ok: false, error: `Unsupported: ${parsed.kind}` };
   }
-  catch (err) {
-    return { ok: false, error: err.message };
-  }
+  return { ok: true, previews: results };
 });
 
-ipcMain.handle('download:start', async (_e, { url, subfolder, modelVersionId }) => {
-  if (currentAbort) return { ok: false, error: 'Another download is in progress' };
+ipcMain.handle('download:start', async (_e, { tasks }) => {
+  if (currentAbort) return { ok: false, error: '已有下载在进行' };
 
   const cfg = loadGuiConfig();
-  if (!cfg.secretKey) return { ok: false, error: 'API key not set' };
-  if (!cfg.downloadDir) return { ok: false, error: 'Download folder not set' };
-
-  const parsed = parseCivitaiUrl(url);
-  if (parsed.kind === 'unknown') return { ok: false, error: 'URL not recognized. Expected /posts/<id>, /models/<id> or /images/<id>' };
+  if (!cfg.secretKey) return { ok: false, error: 'API key 未设置' };
+  if (!cfg.downloadDir) return { ok: false, error: '下载目录未设置' };
+  if (!tasks?.length) return { ok: false, error: '没有任务' };
 
   currentAbort = new AbortController();
   const { signal } = currentAbort;
+  const results = [];
+
   try {
-    emit('download:begin', { kind: parsed.kind });
-    let result;
-    if (parsed.kind === 'post') {
-      result = await downloadPost({ postId: parsed.id, secretKey: cfg.secretKey, downloadDir: cfg.downloadDir, subfolder, signal });
-    } else if (parsed.kind === 'model') {
-      result = await downloadModel({ modelId: parsed.id, modelVersionId: modelVersionId || parsed.modelVersionId, secretKey: cfg.secretKey, downloadDir: cfg.downloadDir, subfolder, signal });
-    } else if (parsed.kind === 'image') {
-      result = await downloadSingleImage({ imageId: parsed.id, secretKey: cfg.secretKey, downloadDir: cfg.downloadDir, subfolder, signal });
-    } else {
-      throw new Error(`Unsupported kind: ${parsed.kind}`);
+    emit('batch:begin', { total: tasks.length });
+    for (let i = 0; i < tasks.length; i++) {
+      if (signal.aborted) break;
+      emit('batch:itemStart', { index: i, total: tasks.length, url: tasks[i].url });
+      try {
+        const r = await runTask(tasks[i], cfg, { signal, taskIndex: i, totalTasks: tasks.length });
+        results.push({ ok: true, url: tasks[i].url, ...r });
+        emit('batch:itemEnd', { index: i, ok: true, ...r });
+      }
+      catch (err) {
+        results.push({ ok: false, url: tasks[i].url, error: err.message });
+        emit('batch:itemEnd', { index: i, ok: false, error: err.message });
+      }
     }
-    emit('download:end', { ok: true, ...result });
-    return { ok: true, ...result };
-  } catch (err) {
-    emit('download:end', { ok: false, error: err.message });
-    return { ok: false, error: err.message };
-  } finally {
+    emit('batch:done', { results });
+    return { ok: true, results };
+  }
+  finally {
     currentAbort = null;
   }
 });

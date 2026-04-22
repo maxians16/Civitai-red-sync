@@ -37,46 +37,36 @@
   </section>
 
   <section class="card">
-    <h2>自定义下载</h2>
-    <p class="hint">粘贴 Civitai 链接,支持:<code>/posts/&lt;id&gt;</code>、<code>/models/&lt;id&gt;</code>、<code>/images/&lt;id&gt;</code></p>
-    <div class="row">
-      <input type="text" id="urlInput" placeholder="https://civitai.red/posts/123456" />
-      <button id="previewBtn" class="primary">预览</button>
+    <h2>批量下载</h2>
+    <p class="hint">每行一个链接。支持:<code>/posts/&lt;id&gt;</code>、<code>/models/&lt;id&gt;</code>、<code>/images/&lt;id&gt;</code></p>
+    <textarea id="urlInput" rows="6" placeholder="https://civitai.red/posts/123
+https://civitai.red/models/456
+https://civitai.red/images/789"></textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="previewBtn" class="primary">预览 / 刷新</button>
+      <button id="clearBtn">清空</button>
+      <span id="urlCount" class="hint"></span>
     </div>
-    <div id="parsedInfo" class="hint"></div>
   </section>
 
   <section class="card" id="previewCard" style="display:none">
-    <h2>预览</h2>
-    <div id="previewMeta" class="preview-meta"></div>
-
-    <div id="versionSelectWrap" style="display:none; margin:10px 0;">
-      <label>版本
-        <select id="versionSelect"></select>
-      </label>
-    </div>
-
-    <div id="previewItems" class="preview-grid"></div>
-    <div id="fileList" class="file-list"></div>
-
-    <label style="margin-top:12px">下载到子文件夹(相对根目录)
-      <div class="row">
-        <input type="text" id="subfolderInput" placeholder="自动" />
-      </div>
-    </label>
-
+    <h2>预览队列 <span id="queueSummary" class="hint"></span></h2>
+    <div id="queueList" class="queue-list"></div>
     <div class="row" style="margin-top:12px">
-      <button id="startBtn" class="primary">开始下载</button>
+      <button id="startBtn" class="primary">开始下载全部</button>
       <button id="cancelBtn" disabled>取消</button>
-      <span id="previewSummary" class="hint"></span>
     </div>
   </section>
 
   <section class="card">
     <h2>进度</h2>
     <div class="progress-wrap">
-      <div class="progress-bar"><div id="progressFill"></div></div>
-      <div id="progressText" class="hint">等待开始</div>
+      <div class="progress-row"><span>总体</span><span id="batchText" class="hint">等待开始</span></div>
+      <div class="progress-bar"><div id="batchFill"></div></div>
+
+      <div class="progress-row" style="margin-top:10px"><span>当前文件</span><span id="fileText" class="hint">—</span></div>
+      <div class="progress-bar"><div id="fileFill"></div></div>
+      <div id="bytesText" class="hint" style="margin-top:4px">—</div>
     </div>
     <pre id="log"></pre>
   </section>
