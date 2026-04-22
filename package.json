@@ -6,6 +6,7 @@
   "scripts": {
     "setup": "npm ci --omit-dev && npm link --force",
     "cli": "node .",
+    "gui": "electron electron/main.mjs",
     "auto-fetch": "node src/commands.mjs auto-fetch",
     "remove-deleted": "node src/commands.mjs remove-deleted",
     "build:ui": "node dev/ui/build.mjs",
@@ -21,6 +22,7 @@
   "devDependencies": {
     "@eslint/js": "^9.2.0",
     "esbuild": "^0.27.3",
+    "electron": "^32.0.0",
     "eslint": "^9.2.0",
     "globals": "^15.2.0",
     "preact": "^10.28.4"
